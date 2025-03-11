@@ -1,10 +1,10 @@
-// lib/auth.ts
 import { NextAuthOptions } from "next-auth";
 import CredentialsProvider from "next-auth/providers/credentials";
 import GoogleProvider from "next-auth/providers/google";
 import { PrismaAdapter } from "@auth/prisma-adapter";
 import { prisma } from "./db";
 import bcrypt from "bcrypt";
+import { cacheUserImage } from "./user-image";
 
 // Extend the Session and JWT types to include the id property
 declare module "next-auth" {
@@ -14,6 +14,7 @@ declare module "next-auth" {
       name?: string | null;
       email?: string | null;
       image?: string | null;
+      cachedImagePath?: string | null;
     }
   }
 }
@@ -21,7 +22,17 @@ declare module "next-auth" {
 declare module "next-auth/jwt" {
   interface JWT {
     id?: string;
+    cachedImagePath?: string | null;
   }
+}
+
+// Define a type for user data
+interface UserWithCachedImage {
+  id: string;
+  email: string;
+  name?: string | null;
+  image?: string | null;
+  cachedImagePath?: string | null;
 }
 
 export const authOptions: NextAuthOptions = {
@@ -31,12 +42,19 @@ export const authOptions: NextAuthOptions = {
   },
   pages: {
     signIn: "/login",
-    error: "/login", // Redirect to login page on error
+    error: "/login",
   },
   providers: [
     GoogleProvider({
       clientId: process.env.GOOGLE_CLIENT_ID!,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      authorization: {
+        params: {
+          prompt: "consent",
+          access_type: "offline",
+          response_type: "code"
+        }
+      }
     }),
     CredentialsProvider({
       name: "Credentials",
@@ -55,7 +73,7 @@ export const authOptions: NextAuthOptions = {
           },
         });
 
-        if (!user || !user.password) {
+        if (!user?.password) {
           return null;
         }
 
@@ -73,6 +91,7 @@ export const authOptions: NextAuthOptions = {
           email: user.email,
           name: user.name,
           image: user.image,
+          cachedImagePath: user.cachedImagePath,
         };
       },
     }),
@@ -82,43 +101,35 @@ export const authOptions: NextAuthOptions = {
       // Initial sign in
       if (user) {
         token.id = user.id;
+        token.cachedImagePath = (user as UserWithCachedImage).cachedImagePath ?? null;
       }
       
       return token;
     },
     async session({ session, token }) {
-      if (token && session.user) {
-        session.user.id = token.id as string;
+      if (token?.id && session.user) {
+        session.user.id = token.id;
+        session.user.cachedImagePath = token.cachedImagePath ?? null;
       }
       return session;
     },
   },
   events: {
-    async signIn({ user, account }) {
-      // If this is the first time a user is signing in with Google
-      if (account?.provider === 'google' && user.email) {
-        // Check if this user already exists (might have registered with credentials)
-        const existingUser = await prisma.user.findUnique({
-          where: { email: user.email },
-          include: { accounts: true }
-        });
-
-        // If user exists but doesn't have a Google account linked
-        if (existingUser && existingUser.accounts.length === 0) {
-          // Link the Google account to the existing user
-          await prisma.account.create({
-            data: {
-              userId: existingUser.id,
-              type: account.type,
-              provider: account.provider,
-              providerAccountId: account.providerAccountId,
-              access_token: account.access_token,
-              expires_at: account.expires_at,
-              token_type: account.token_type,
-              scope: account.scope,
-              id_token: account.id_token,
-            }
+    async signIn({ user, account: _account }) {
+      // If this is a Google sign-in with a profile image
+      if (_account?.provider === 'google' && user.id && user.image) {
+        try {
+          // Cache the profile image to avoid 429 errors
+          const cachedImageUrl = await cacheUserImage(user.id, user.image);
+          
+          // Update the user with the cached image path
+          await prisma.user.update({
+            where: { id: user.id },
+            data: { cachedImagePath: cachedImageUrl }
           });
+        } catch (error) {
+          console.error("Error caching Google profile image during sign in:", error);
+          // Continue sign-in process even if image caching fails
         }
       }
     }
